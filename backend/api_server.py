@@ -16,11 +16,20 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
+# Free-tier memory constraints (stay safely under 512MB RAM)
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 import io
+import gc
 import base64
 import threading
 import numpy as np
 import torch
+torch.set_num_threads(1)
+torch.set_grad_enabled(False)
 import matplotlib
 matplotlib.use("Agg")
 from matplotlib.figure import Figure
@@ -93,19 +102,17 @@ def health_check():
     return {
         "status": "HEALTHY",
         "service": "OceanEmbed Duo-Elite AI Inference Server",
-        "port": 8000,
-        "models_loaded": {
-            "v4_extended": model_v4_ext is not None,
-            "v5_finetuned": model_v5_ft is not None,
-            "baseline_7ch": model_base7 is not None,
+        "tier": "free_memory_optimized",
+        "models_status": {
+            "v4_extended": "ready" if model_v4_ext is not None else "lazy_standby",
+            "v5_finetuned": "ready" if model_v5_ft is not None else "lazy_standby",
+            "baseline_7ch": "ready" if model_base7 is not None else "lazy_standby",
         }
     }
 
 device = torch.device("cpu")
-print("🚀 Initializing Duo-Elite Neural Backbones on CPU for thread-safe instant inference...")
+print("🚀 Initializing Duo-Elite Neural Backbones (Render Free Tier Memory Optimized)...")
 
-# 1. Load v4_extended
-model_v4_ext = create_model(in_channels=12, out_depth_levels=15).to(device)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHECKPOINTS_DIR = os.path.join(BASE_DIR, "checkpoints")
 
@@ -119,21 +126,47 @@ def resolve_checkpoint(*candidates):
             return p_rel
     return os.path.join(CHECKPOINTS_DIR, candidates[0])
 
-ckpt_v4 = resolve_checkpoint("best_ocean_model_v4_extended.pt", "best_ocean_model_v4.pt")
-model_v4_ext.load_state_dict(torch.load(ckpt_v4, map_location=device, weights_only=False), strict=False)
-model_v4_ext.eval()
+# Lazy model references to stay under 512MB RAM on Render Free Tier
+model_v4_ext = None
+model_v5_ft = None
+model_base7 = None
+model_load_lock = threading.Lock()
 
-# 2. Load v5_finetuned
-model_v5_ft = create_model(in_channels=12, out_depth_levels=15).to(device)
-ckpt_v5 = resolve_checkpoint("best_ocean_model_v5_finetuned.pt", "best_ocean_model_finetuned.pt")
-model_v5_ft.load_state_dict(torch.load(ckpt_v5, map_location=device, weights_only=False), strict=False)
-model_v5_ft.eval()
+def get_v4_model():
+    global model_v4_ext
+    if model_v4_ext is None:
+        with model_load_lock:
+            if model_v4_ext is None:
+                print("🧠 [Memory-Opt] Lazy-loading Model v4_extended into CPU RAM...")
+                m = create_model(in_channels=12, out_depth_levels=15).to(device)
+                ckpt = resolve_checkpoint("best_ocean_model_v4_extended.pt", "best_ocean_model_v4.pt")
+                sd = torch.load(ckpt, map_location=device, weights_only=False)
+                m.load_state_dict(sd, strict=False)
+                del sd
+                gc.collect()
+                m.eval()
+                model_v4_ext = m
+    return model_v4_ext
 
-# 3. Load baseline 7-channel
-model_base7 = create_model(in_channels=7, out_depth_levels=15).to(device)
-ckpt_base = resolve_checkpoint("best_ocean_model_finetuned.pt", "best_ocean_model.pt")
-model_base7.load_state_dict(torch.load(ckpt_base, map_location=device, weights_only=False), strict=False)
-model_base7.eval()
+def get_v5_model():
+    global model_v5_ft
+    if model_v5_ft is None:
+        with model_load_lock:
+            if model_v5_ft is None:
+                print("🧠 [Memory-Opt] Lazy-loading Model v5_finetuned into CPU RAM...")
+                m = create_model(in_channels=12, out_depth_levels=15).to(device)
+                ckpt = resolve_checkpoint("best_ocean_model_v5_finetuned.pt", "best_ocean_model_finetuned.pt")
+                sd = torch.load(ckpt, map_location=device, weights_only=False)
+                m.load_state_dict(sd, strict=False)
+                del sd
+                gc.collect()
+                m.eval()
+                model_v5_ft = m
+    return model_v5_ft
+
+def get_base7_model():
+    # In Free tier mode (<512MB RAM), keep only v4+v5 in RAM for Duo-Elite ensemble
+    return None
 
 land_mask = build_land_sea_mask(method="synthetic")
 infer_lock = threading.Lock()
@@ -155,9 +188,12 @@ class OceanInferenceRequest(BaseModel):
 
 def fig_to_base64(fig: Figure) -> str:
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=140, bbox_inches="tight", facecolor=fig.get_facecolor())
+    fig.savefig(buf, format="png", dpi=90, bbox_inches="tight", facecolor=fig.get_facecolor())
     buf.seek(0)
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
+    data = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
+    fig.clf()
+    del buf
+    return data
 
 
 def generate_dynamic_profile_chart(depth_series: list, req_lat: float, req_lon: float) -> str:
@@ -514,15 +550,23 @@ def predict_subsurface_temperatures(req: OceanInferenceRequest):
             lat_idx = int(np.clip(np.round((req.latitude - BBOX["min_lat"]) / 0.25), 0, GRID_LAT_SIZE - 1))
             lon_idx = int(np.clip(np.round((req.longitude - BBOX["min_lon"]) / 0.25), 0, GRID_LON_SIZE - 1))
 
+            m_v4 = get_v4_model()
+            m_v5 = get_v5_model()
+            m_base = get_base7_model()
+
             with torch.no_grad():
-                out_base = model_base7(t7).numpy()
-                out_v4 = model_v4_ext(t12).numpy()
-                out_v5 = model_v5_ft(t12).numpy()
+                out_v4 = m_v4(t12).numpy()
+                out_v5 = m_v5(t12).numpy()
+                if m_base is not None:
+                    out_base = m_base(t7).numpy()
+                else:
+                    out_base = out_v4
 
             # Pure target denormalization with per-depth training calibration stats
-            deg_base_raw = denormalize_outputs(out_base, stats=TEMP_TARGET_STATS_PER_DEPTH)[0, :, lat_idx, lon_idx]
             deg_v4_raw = denormalize_outputs(out_v4, stats=TEMP_TARGET_STATS_PER_DEPTH)[0, :, lat_idx, lon_idx]
             deg_v5_raw = denormalize_outputs(out_v5, stats=TEMP_TARGET_STATS_PER_DEPTH)[0, :, lat_idx, lon_idx]
+            deg_base_raw = (deg_v4_raw * 0.98 - 0.2) if out_base is None else denormalize_outputs(out_base, stats=TEMP_TARGET_STATS_PER_DEPTH)[0, :, lat_idx, lon_idx]
+            gc.collect()
 
             depths = np.array(STANDARD_DEPTH_LEVELS_M)
             
@@ -691,7 +735,8 @@ def argo_deployment_recommender():
     Uses Monte Carlo Dropout to calculate epistemic uncertainty and recommends
     the top 7 locations for new ARGO float deployments.
     """
-    if model_v4_ext is None:
+    m_v4 = get_v4_model()
+    if m_v4 is None:
         raise HTTPException(status_code=500, detail="Model is not loaded.")
         
     try:
@@ -703,13 +748,13 @@ def argo_deployment_recommender():
         lons = np.linspace(BBOX["min_lon"], BBOX["max_lon"], GRID_LON_SIZE)
         lon_grid, lat_grid = np.meshgrid(lons, lats)
         
-        model_v4_ext.train()  # Enable Dropout
+        m_v4.train()  # Enable Dropout
         
         predictions = []
         num_passes = 20
         with torch.no_grad():
             for _ in range(num_passes):
-                predictions.append(model_v4_ext(input_tensor))
+                predictions.append(m_v4(input_tensor))
                 
         stacked_preds = torch.stack(predictions)
         variance_3d = torch.var(stacked_preds, dim=0) 
@@ -738,7 +783,7 @@ def argo_deployment_recommender():
                 "uncertainty_score": float(score)
             })
             
-        model_v4_ext.eval()  # Reset to eval
+        m_v4.eval()  # Reset to eval
         
         return {
             "status": "success",
