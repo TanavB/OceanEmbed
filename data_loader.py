@@ -1,15 +1,26 @@
 """
 ================================================================================
-OceanEmbed - Data Pipeline (data_loader.py)  [UPGRADED v2]
+OceanEmbed - Data Pipeline & Preprocessing Dataset (data_loader.py)
 ================================================================================
-CHANGES FROM v1:
-  - Input channels: 3 → 7 (added U_CUR, V_CUR, U_WIND, V_WIND)
-  - Depth levels: 14 custom → 15 standard hackathon levels
-  - Grid size: 64×128 arbitrary → 101×241 (0.25° North Indian Ocean)
-  - Added: full preprocessing pipeline integration (normalize, mask, fill)
-  - Added: GLORYS real data loading stub for all 7 channels + target
+Manages dataset loading, spatial-median land-mask imputation, per-channel normalization,
+and PyTorch DataLoader batching for Apple Silicon MPS.
 
-TARGET: North Indian Ocean, 5°N–30°N, 45°E–105°E, 0.25° × 0.25°, daily
+PREPROCESSING PIPELINE FOR EACH DAILY OCEAN SLICE:
+  1. Land Mask Extraction:
+     • Identifies valid ocean water cells where SST is non-NaN.
+     • Valid Ocean Mask: M(x, y) = True if SST(x, y) is finite, else False.
+  2. Spatial Median Imputation:
+     • Land pixels (NaNs) are filled with the median value of surrounding water pixels:
+         x_fill(x, y) = median( { x(x', y') | M(x', y') = True } )
+     • Guarantees numerical stability and prevents NaN propagation through convolutions.
+  3. Per-Channel Physical Normalization:
+     • Each channel c is normalized into zero-mean, unit-variance standardized space:
+         x_norm(c, x, y) = ( x(c, x, y) - mu_c ) / sigma_c
+     • Land pixels are explicitly zeroed after normalization:
+         x_norm(c, x, y) = 0  for all (x, y) where M(x, y) = False
+  4. Per-Depth Target Standardization:
+     • Target temperatures are standardized per depth level z in [0..14]:
+         T_norm(z, x, y) = ( T(z, x, y) - mu_z ) / sigma_z
 ================================================================================
 """
 
@@ -219,24 +230,42 @@ class OceanDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Returns one daily training pair after full preprocessing."""
-        raw_inputs = self.inputs[idx]     # (7, 101, 241)
+        raw_inputs = self.inputs[idx]     # (C, 101, 241)
         raw_targets = self.targets[idx]   # (15, 101, 241)
 
-        # Run the full preprocessing pipeline on inputs
-        processed_inputs, mask, _ = preprocess_inputs(
-            raw_inputs,
+        # 1. Preprocess physical channels (0 to 6)
+        p_phys, mask, _ = preprocess_inputs(
+            raw_inputs[:7],
             stats=self.norm_stats,
             mask=self.land_mask,
             nan_fill_method="spatial_median",
         )
 
-        # Normalize targets (temperature) independently
-        target_mean = self.norm_stats["TEMP_TARGET"]["mean"]
-        target_std  = self.norm_stats["TEMP_TARGET"]["std"]
-        processed_targets = (raw_targets - target_mean) / target_std
+        # 2. If extra channels exist (DOY harmonics, SST Anomaly, MLD proxy), mask & zero-fill NaNs
+        if raw_inputs.shape[0] > 7:
+            extra_ch = raw_inputs[7:].copy()
+            # Replace NaNs over land with 0.0
+            extra_ch = np.where(np.isnan(extra_ch), 0.0, extra_ch)
+            # Apply ocean mask to extra channels as well
+            for ch_i in range(extra_ch.shape[0]):
+                extra_ch[ch_i][~mask] = 0.0
+            processed_inputs = np.concatenate([p_phys, extra_ch], axis=0)
+        else:
+            processed_inputs = p_phys
 
-        # Fill any NaN in targets (e.g. below seafloor in shallow areas)
-        processed_targets = np.where(np.isnan(processed_targets), 0.0, processed_targets)
+        # Ensure entire input tensor is completely free of NaNs and Infs
+        processed_inputs = np.nan_to_num(processed_inputs, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 3. Per-Depth Target Normalization (Feature 3)
+        from config import TEMP_TARGET_STATS_PER_DEPTH
+        processed_targets = np.zeros_like(raw_targets, dtype=np.float32)
+        for d_idx in range(min(15, raw_targets.shape[0])):
+            d_mean = TEMP_TARGET_STATS_PER_DEPTH[d_idx]["mean"]
+            d_std  = TEMP_TARGET_STATS_PER_DEPTH[d_idx]["std"]
+            processed_targets[d_idx] = (raw_targets[d_idx] - d_mean) / d_std
+
+        # Fill any NaN in targets (over land / below seafloor) with 0.0
+        processed_targets = np.nan_to_num(processed_targets, nan=0.0, posinf=0.0, neginf=0.0)
 
         return (
             torch.from_numpy(processed_inputs.astype(np.float32)),

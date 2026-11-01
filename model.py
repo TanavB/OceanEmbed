@@ -1,37 +1,34 @@
 """
 ================================================================================
-OceanEmbed - Model Architecture (model.py)  [UPGRADED v2]
+OceanEmbed - Hybrid CNN-ViT Architecture (model.py)
 ================================================================================
-CHANGES FROM v1:
-  - in_channels: 3 → 7 (SST, SSS, SSH, U_CUR, V_CUR, U_WIND, V_WIND)
-  - out_depth_levels: 14 → 15 (standard hackathon depth levels)
-  - base_filters: 32 → 64 (more capacity for 7 input channels)
-  - ViT heads: 4 → 8 (richer attention for larger bottleneck)
-  - Added: get_embedding() method for latent space extraction
-  - Added: 4-level encoder/decoder (deeper U-Net for 101×241 spatial input)
+Implements the hybrid Convolutional Vision Transformer (OceanUNetViT) for
+continuous 3D ocean subsurface thermal inversion: T(x, y, z, t) from 2D satellite surface observations.
 
-ARCHITECTURE SUMMARY:
-  [Input: (B, 7, 101, 241)]
-       ↓
-  ┌────────────────────────────┐
-  │  ENCODER (4 levels, CNN)   │  Progressively compresses spatial resolution
-  │  Level 1: (B, 64, 101, 241)│  Full resolution — fine coastal details
-  │  Level 2: (B, 128, 50, 120)│  Half resolution — mesoscale eddies
-  │  Level 3: (B, 256, 25, 60) │  Quarter — regional circulation patterns
-  │  Level 4: (B, 512, 12, 30) │  Eighth — basin-scale dynamics
-  └─────────────┬──────────────┘
-               ↓
-  ┌────────────────────────────┐
-  │  BOTTLENECK (ViT, 8 heads) │  Global North Indian Ocean teleconnections
-  │  Compact Embedding Vector  │  (B, 256) — extracted by get_embedding()
-  └─────────────┬──────────────┘
-               ↓
-  ┌────────────────────────────┐
-  │  DECODER (4 levels)        │  Upsamples + skip connections
-  │  Projects to 15 depth layers│
-  └────────────────────────────┘
-       ↓
-  [Output: (B, 15, 101, 241)]
+TENSOR SHAPE EVOLUTION THROUGH THE NETWORK:
+  1. Input Surface Tensor:  (B, 12, H=101, W=241)
+  2. Encoder Level 1 (CNN): (B, 64,  H=101, W=241)  [Full resolution — fine coastal details]
+     └── MaxPool2d(2x2) ──▶ (B, 64,  H=50,  W=120)
+  3. Encoder Level 2 (CNN): (B, 128, H=50,  W=120)  [Half resolution — mesoscale eddies]
+     └── MaxPool2d(2x2) ──▶ (B, 128, H=25,  W=60)
+  4. Encoder Level 3 (CNN): (B, 256, H=25,  W=60)   [Quarter resolution — regional circulation]
+     └── MaxPool2d(2x2) ──▶ (B, 256, H=12,  W=30)
+  5. Encoder Level 4 (CNN): (B, 512, H=12,  W=30)   [Eighth resolution — basin-scale dynamics]
+  6. Vision Transformer Bottleneck (ViT):
+     • Flattens spatial map into 360 tokens: (B, 360, d_embed=256)
+     • Runs 8 Multi-Head Self-Attention layers:
+         Attention(Q, K, V) = softmax( (Q * K^T) / sqrt(d_k) ) * V
+     • Captures global teleconnections across the North Indian Ocean basin.
+     • Unflattens back to feature maps: (B, 512, 12, 30)
+  7. Decoder Level 4 (CNN): TransposeConv + Skip(Enc4) ──▶ (B, 256, 25, 60)
+  8. Decoder Level 3 (CNN): TransposeConv + Skip(Enc3) ──▶ (B, 128, 50, 120)
+  9. Decoder Level 2 (CNN): TransposeConv + Skip(Enc2) ──▶ (B, 64,  101, 241)
+  10. Decoder Level 1 (CNN): DoubleConv refinement     ──▶ (B, 64,  101, 241)
+  11. Output Projection Head + Depth Bias Vector:
+      • 1x1 Conv2D maps 64 channels ──▶ 15 Depth Channels
+      • Adds learnable depth bias vector b_z in R^15:
+          T_pred(x, y, z) = Conv_1x1(Feature_Map) + b_z
+      • Output Shape: (B, 15, H=101, W=241)
 ================================================================================
 """
 
@@ -163,18 +160,21 @@ class TransformerBottleneck(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_attention: bool = False) -> torch.Tensor:
         B, C, H, W = x.shape
         # Flatten spatial dims → sequence of tokens: (B, H*W, C)
         tokens = x.flatten(2).transpose(1, 2)
         # Self-Attention with residual
         normed = self.norm1(tokens)
-        attn_out, _ = self.attn(normed, normed, normed)
+        attn_out, attn_weights = self.attn(normed, normed, normed, need_weights=True)
         tokens = tokens + self.dropout(attn_out)
         # Feed-Forward MLP with residual
         tokens = tokens + self.mlp(self.norm2(tokens))
         # Reshape back to spatial map: (B, C, H, W)
-        return tokens.transpose(1, 2).reshape(B, C, H, W)
+        out_spatial = tokens.transpose(1, 2).reshape(B, C, H, W)
+        if return_attention:
+            return out_spatial, attn_weights
+        return out_spatial
 
 
 # ==============================================================================
@@ -272,22 +272,26 @@ class OceanUNetViT(nn.Module):
         # OUTPUT HEAD — Projects from base_filters → 15 depth levels
         # ----------------------------------------------------------------------
         self.output_head = nn.Conv2d(f, out_depth_levels, kernel_size=1)
+        # Learnable per-depth bias correction layer (Feature 4)
+        self.depth_bias = nn.Parameter(torch.zeros(1, out_depth_levels, 1, 1))
 
     def forward(
-        self, x: torch.Tensor, return_embedding: bool = False
+        self, x: torch.Tensor, return_embedding: bool = False, return_attention: bool = False
     ) -> Tuple[torch.Tensor, ...]:
         """
         Forward pass.
 
         Parameters:
         -----------
-        x : torch.Tensor — (B, 7, 101, 241)
-        return_embedding : bool — if True, also returns the (B, 256) latent vector
+        x : torch.Tensor — (B, in_channels, 101, 241)
+        return_embedding : bool — if True, returns (predictions, embedding)
+        return_attention : bool — if True, returns (predictions, attn_weights)
 
         Returns:
         --------
         predictions : (B, 15, 101, 241)
         embedding   : (B, 256)  — only if return_embedding=True
+        attention   : (B, num_heads, tokens, tokens) — only if return_attention=True
         """
         # --- Encoder ---
         s1, p1 = self.enc1(x)    # s1: (B,64,101,241)  p1: (B,64,50,120)
@@ -297,7 +301,10 @@ class OceanUNetViT(nn.Module):
 
         # --- Bottleneck ---
         b = self.bottleneck_conv(p4)   # (B, 512, 6, 15)
-        b = self.vit(b)                # Self-Attention over 6×15=90 ocean tokens
+        if return_attention:
+            b, attn_weights = self.vit(b, return_attention=True)
+        else:
+            b = self.vit(b, return_attention=False)
 
         # --- Compact Embedding ---
         embedding = self.embedding_proj(b)  # (B, 256)
@@ -308,11 +315,15 @@ class OceanUNetViT(nn.Module):
         d2 = self.dec2(d3, s2)   # (B, 64, 50, 120)
         d1 = self.dec1(d2, s1)   # (B, 64, 101, 241)
 
-        # --- Output Projection ---
-        predictions = self.output_head(d1)  # (B, 15, 101, 241)
+        # --- Output Projection + Depth Bias Correction ---
+        predictions = self.output_head(d1) + self.depth_bias  # (B, 15, 101, 241)
 
+        if return_embedding and return_attention:
+            return predictions, embedding, attn_weights
         if return_embedding:
             return predictions, embedding
+        if return_attention:
+            return predictions, attn_weights
         return predictions
 
     def get_embedding(self, x: torch.Tensor) -> torch.Tensor:
