@@ -106,19 +106,32 @@ print("🚀 Initializing Duo-Elite Neural Backbones on CPU for thread-safe insta
 
 # 1. Load v4_extended
 model_v4_ext = create_model(in_channels=12, out_depth_levels=15).to(device)
-ckpt_v4 = "checkpoints/best_ocean_model_v4_extended.pt" if os.path.exists("checkpoints/best_ocean_model_v4_extended.pt") else "checkpoints/best_ocean_model_v4.pt"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CHECKPOINTS_DIR = os.path.join(BASE_DIR, "checkpoints")
+
+def resolve_checkpoint(*candidates):
+    for c in candidates:
+        p_base = os.path.join(CHECKPOINTS_DIR, c)
+        if os.path.exists(p_base):
+            return p_base
+        p_rel = os.path.join("checkpoints", c)
+        if os.path.exists(p_rel):
+            return p_rel
+    return os.path.join(CHECKPOINTS_DIR, candidates[0])
+
+ckpt_v4 = resolve_checkpoint("best_ocean_model_v4_extended.pt", "best_ocean_model_v4.pt")
 model_v4_ext.load_state_dict(torch.load(ckpt_v4, map_location=device, weights_only=False), strict=False)
 model_v4_ext.eval()
 
 # 2. Load v5_finetuned
 model_v5_ft = create_model(in_channels=12, out_depth_levels=15).to(device)
-ckpt_v5 = "checkpoints/best_ocean_model_v5_finetuned.pt" if os.path.exists("checkpoints/best_ocean_model_v5_finetuned.pt") else "checkpoints/best_ocean_model_finetuned.pt"
+ckpt_v5 = resolve_checkpoint("best_ocean_model_v5_finetuned.pt", "best_ocean_model_finetuned.pt")
 model_v5_ft.load_state_dict(torch.load(ckpt_v5, map_location=device, weights_only=False), strict=False)
 model_v5_ft.eval()
 
 # 3. Load baseline 7-channel
 model_base7 = create_model(in_channels=7, out_depth_levels=15).to(device)
-ckpt_base = "checkpoints/best_ocean_model_finetuned.pt" if os.path.exists("checkpoints/best_ocean_model_finetuned.pt") else "checkpoints/best_ocean_model.pt"
+ckpt_base = resolve_checkpoint("best_ocean_model_finetuned.pt", "best_ocean_model.pt")
 model_base7.load_state_dict(torch.load(ckpt_base, map_location=device, weights_only=False), strict=False)
 model_base7.eval()
 
