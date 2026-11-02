@@ -215,12 +215,15 @@ export default function OceanEmbedDashboard() {
     setIsLoading(true);
 
     try {
+      const backendUrl = process.env.NEXT_PUBLIC_API_URL || "https://oceanembed-backend-uyvg.onrender.com";
+      
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 60000);
-
-      const res = await fetch("http://localhost:8000/api/predict", {
+      const timeoutId = setTimeout(( () => controller.abort() ), 6e4)
+      const res = await fetch(`${backendUrl}/api/predict`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json"
+        },
         signal: controller.signal,
         body: JSON.stringify({
           latitude: lat,
@@ -233,7 +236,7 @@ export default function OceanEmbedDashboard() {
           u_wind: uWind,
           v_wind: vWind,
           doy: doy,
-        }),
+        })
       });
       clearTimeout(timeoutId);
 
